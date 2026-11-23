@@ -111,10 +111,15 @@ jobs:
           security unlock-keychain -p "$pass" "$keychain"
           security import "$RUNNER_TEMP/cert.p12" -P "$MAC_CERT_PASSWORD" -f pkcs12 -k "$keychain" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/cert.p12"
+          # Apple's Developer ID intermediate (G2): without it the certificate isn't trusted, find-identity -v skips it
+          # and codesign can't build the chain. The image may have it already; a second copy here does no harm.
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" || true
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pass" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$keychain" | sed -E 's/[0-9A-F]{40}/<hash>/'
           id=$(security find-identity -v -p codesigning "$keychain" | grep -m1 'Developer ID Application' | sed -E 's/.*"(.*)"/\1/' || true)
-          [[ -n "$id" ]] || { echo "MAC_CERT_P12 holds no 'Developer ID Application' identity" >&2; exit 1; }
+          [[ -n "$id" ]] || { echo "MAC_CERT_P12 holds no valid 'Developer ID Application' identity (see the list above)" >&2; exit 1; }
           echo "SIGN_ID=$id" >> "$GITHUB_ENV"
 
       # Reported, not required: the runner's virtual GPU may lack what the engine's GPU tests use. The fixes are tested
