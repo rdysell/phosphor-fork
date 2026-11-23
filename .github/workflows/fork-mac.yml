@@ -1,0 +1,253 @@
+# Rob's fork only (rdysell/phosphor-fork), never upstream. Builds the Apple Silicon Mac app from the `rob` branch
+# (upstream main + every fix in fork-fixes.txt, rebuilt and pushed by scripts/fork/update-fork.sh) and publishes it as
+# a release of the fork: tag v<upstream version>-rob.<run number>, with Phosphor-mac.zip, the zip the app's updater
+# downloads. On this branch the updater reads only the fork's releases (crates/phosphor/src/update.rs), so a build of
+# `rob` keeps its fixes when it updates. Fork-only branch `fork-updater`; see FORK.md on the fork's `fork-tools` branch.
+#
+# Signing: ad-hoc by default. The first install by hand is blocked once by macOS (System Settings › Privacy & Security ›
+# Open Anyway); updates the app installs itself aren't. With all five repository secrets below it's signed with a
+# Developer ID certificate and notarized instead (untested until they exist):
+#   MAC_CERT_P12       base64 of the "Developer ID Application" certificate exported as .p12, with its private key
+#   MAC_CERT_PASSWORD  that .p12's password
+#   NOTARY_APPLE_ID, NOTARY_TEAM_ID, NOTARY_PASSWORD   Apple ID, team ID and an app-specific password, for notarytool
+# Once builds are signed, keep the secrets: a signed install refuses an ad-hoc update (update.rs `same_signer`).
+#
+# Keep this file's name: the build number is its run number, and a renamed workflow counts from 1 again (no update
+# would be offered until upstream's next version).
+name: Fork Mac build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [rob]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+# A newer push to rob replaces a build still running, so the newest build is always the latest release. (A re-run of an
+# older run cancels the newest one too, and then publishes nothing: re-run the newest run after such a slip.)
+concurrency:
+  group: fork-mac
+  cancel-in-progress: true
+
+permissions:
+  contents: write # creates the release and its tag
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # Nowhere but the fork (if this file ever reached upstream, its job is skipped there), and only `rob`: a manual run
+    # on another branch would publish, as the newest build, an app without the fixes.
+    if: github.repository == 'rdysell/phosphor-fork' && github.ref == 'refs/heads/rob'
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: never
+      # No screen to draw the panels on (bundle-mac.sh's panel check); the launch test below is the smoke test.
+      SKIP_PANEL_CHECK: "1"
+      SIGNED: ${{ secrets.MAC_CERT_P12 != '' && secrets.MAC_CERT_PASSWORD != '' }}
+      NOTARIZED: ${{ secrets.MAC_CERT_P12 != '' && secrets.MAC_CERT_PASSWORD != '' && secrets.NOTARY_APPLE_ID != '' && secrets.NOTARY_TEAM_ID != '' && secrets.NOTARY_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Whole history: the fork's main (= upstream) for the release notes, the commit count for CFBundleVersion.
+          fetch-depth: 0
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build tools
+        run: brew install nasm ninja pkg-config || true
+
+      # FFmpeg (and dav1d, libvpx, OpenSSL) for macOS 13 on Apple Silicon: built once, kept until the script changes.
+      - uses: actions/cache@v4
+        with:
+          path: vendor/ffmpeg
+          key: mac-arm64-ffmpeg-${{ hashFiles('scripts/build-ffmpeg-mac.sh', 'scripts/min-macos') }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/bundle
+          key: mac-arm64-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mac-arm64-cargo-
+
+      - name: FFmpeg
+        run: "[[ -x vendor/ffmpeg/bin/ffmpeg ]] || scripts/build-ffmpeg-mac.sh"
+
+      # The version every part of the app reports (About, update window, logs, crash reports): upstream's plus
+      # -rob.<run number>, which the fork's updater orders after upstream's release and before the next one.
+      - name: Version
+        id: version
+        run: |
+          base=$(grep -m1 '^version' crates/phosphor/Cargo.toml | cut -d'"' -f2)
+          ver="$base-rob.$GITHUB_RUN_NUMBER"
+          # Only the app's own version (the first version line); cargo updates Cargo.lock to match when it builds.
+          perl -0pi -e "s/^version = \"\Q$base\E\"/version = \"$ver\"/m" crates/phosphor/Cargo.toml
+          [[ "$(grep -m1 '^version' crates/phosphor/Cargo.toml)" == "version = \"$ver\"" ]]
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Phosphor $ver"
+
+      - name: Signing certificate
+        if: env.SIGNED == 'true'
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pass=$(uuidgen)
+          printf '%s' "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MAC_CERT_PASSWORD" -f pkcs12 -k "$keychain" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          id=$(security find-identity -v -p codesigning "$keychain" | grep -m1 'Developer ID Application' | sed -E 's/.*"(.*)"/\1/' || true)
+          [[ -n "$id" ]] || { echo "MAC_CERT_P12 holds no 'Developer ID Application' identity" >&2; exit 1; }
+          echo "SIGN_ID=$id" >> "$GITHUB_ENV"
+
+      # Reported, not required: the runner's virtual GPU may lack what the engine's GPU tests use. The fixes are tested
+      # before they're pushed, and upstream's own CI tests upstream's code.
+      - name: Engine tests
+        continue-on-error: true
+        run: cargo test -p phosphor-engine --release
+
+      - name: App bundle
+        run: |
+          # Detached, like upstream's release builds: bundle-mac.sh marks a build made on any branch but main as a test
+          # build, whose updates wait for a click. This is the fork's release build.
+          git checkout --quiet --detach
+          scripts/bundle-mac.sh --no-install
+
+      - name: What it needs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          exe=dist/Phosphor.app/Contents/MacOS/Phosphor
+          plist=dist/Phosphor.app/Contents/Info.plist
+          file "$exe"
+          [[ " $(lipo -archs "$exe") " == *" arm64 "* ]]
+          # Every library it links must be inside the app or part of macOS (the first line is the file's own name).
+          if otool -L "$exe" | tail -n +2 | grep -v "@rpath\|/usr/lib\|/System/Library"; then exit 1; fi
+          # It starts (every bundled library loads) and says it's this fork build.
+          said=$("$exe" --version)
+          echo "$said"
+          [[ "$said" == "Phosphor $VERSION" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" == "$VERSION" ]]
+          if /usr/libexec/PlistBuddy -c 'Print :PhosphorTestBuild' "$plist" >/dev/null 2>&1; then echo "marked as a test build" >&2; exit 1; fi
+
+      - name: Notarize
+        if: env.NOTARIZED == 'true'
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          scripts/zip-app.sh dist Phosphor.app notarize.zip
+          xcrun notarytool submit dist/notarize.zip --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" --password "$NOTARY_PASSWORD" --wait
+          rm -f dist/notarize.zip
+          xcrun stapler staple dist/Phosphor.app
+          spctl -a -t exec -vv dist/Phosphor.app
+
+      - name: Zip
+        run: scripts/zip-app.sh dist Phosphor.app Phosphor-mac.zip && ls -la dist
+
+      # Unpacked the ways people's Macs do, signature checked after each (scripts/check-downloads.sh when notarized;
+      # that script expects Phosphor-mac.zip notarized, so an ad-hoc one gets the same checks without Gatekeeper's).
+      - name: Check the download
+        run: |
+          rm -rf dist/check && mkdir -p dist/check && cp dist/Phosphor-mac.zip dist/check/
+          if [[ "$NOTARIZED" == true ]]; then
+            CHECK_RUN=0 scripts/check-downloads.sh dist/check
+            exit
+          fi
+          # (No grep -q after a long pipe: with pipefail, grep quitting early fails the writer and hides a match.)
+          if unzip -l dist/Phosphor-mac.zip | grep -E '/\._|__MACOSX' >/dev/null; then echo "the zip holds ._ entries" >&2; exit 1; fi
+          for tool in ditto unzip bsdtar; do
+            out=dist/check/$tool && mkdir -p "$out"
+            case $tool in
+              ditto) ditto -x -k dist/Phosphor-mac.zip "$out" ;;
+              unzip) unzip -q dist/Phosphor-mac.zip -d "$out" ;;
+              bsdtar) bsdtar -xf dist/Phosphor-mac.zip -C "$out" ;;
+            esac
+            [[ -d "$out/Phosphor.app" ]] || { echo "$tool: no Phosphor.app at the top of the zip" >&2; exit 1; }
+            if [[ -n "$(find "$out/Phosphor.app" -name '._*' -print -quit)" ]]; then echo "$tool: ._ files in the app" >&2; exit 1; fi
+            codesign --verify --deep --strict "$out/Phosphor.app"
+            echo "$tool: ok"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Phosphor-mac
+          path: dist/Phosphor-mac.zip
+
+      # Smoke test: open the app for a few seconds with the test project. The runner may have no usable GPU, so this
+      # is reported, not required.
+      - name: Launch test
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          dist/Phosphor.app/Contents/MacOS/Phosphor --bench 4 --project scripts/ci/smoke.phosphor --snapshot "$PWD/dist/snapshot.png" > dist/launch.txt 2>&1 &
+          pid=$!
+          for i in $(seq 1 120); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+          kill $pid 2>/dev/null || true
+          grep -E "SUMMARY|LAYERS|LAYER_ERROR|panicked|GPU" dist/launch.txt | head -20
+          test -f dist/snapshot.png
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: launch-test
+          path: |
+            dist/launch.txt
+            dist/snapshot.png
+          if-no-files-found: ignore
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BASE: ${{ steps.version.outputs.base }}
+        run: |
+          tag="v$VERSION"
+          # Only the newest rob's code is published: a re-run of an older run would otherwise make "latest" go back to
+          # it. A later push that changed only what paths-ignore skips (docs, .md files) starts no build, so this
+          # build still counts then. (A failed fetch or diff counts as different: nothing is published.)
+          git fetch --quiet origin refs/heads/rob
+          if ! git diff --quiet "$GITHUB_SHA" FETCH_HEAD -- . ':!docs' ':!*.md'; then
+            echo "::error::rob is at $(git rev-parse FETCH_HEAD) now, with code this build ($GITHUB_SHA) doesn't have: not published (its zip is in this run's artifacts)."
+            exit 1
+          fi
+          # What's in it: upstream's commit (the fork's main is upstream's) and the fix branches merged on top of it.
+          upstream=$(git log -1 --format=%h origin/main 2>/dev/null || echo unknown)
+          fixes=$(git log --reverse --first-parent --merges --format='- %s' origin/main..HEAD 2>/dev/null | sed 's/^- rob: merge /- /' || true)
+          {
+            echo "Rob's build of Phosphor VJ: upstream [fillinthe/phosphor](https://github.com/fillinthe/phosphor) $BASE (\`$upstream\`) with these branches of this fork merged on top:"
+            echo
+            echo "${fixes:-- (none)}"
+            echo
+            echo "An unofficial, modified build (GPL-3.0-or-later); its source is this release's tag. Apple Silicon Macs, macOS 13 or later."
+            echo
+            if [[ "$NOTARIZED" == true ]]; then
+              echo "Signed and notarized."
+            else
+              echo "Not notarized. The first time, macOS blocks it: open System Settings › Privacy & Security and click Open Anyway. Updates the app installs itself open without that. macOS may ask again for camera, microphone and screen recording access after an update."
+            fi
+          } > dist/notes.md
+          cat dist/notes.md
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A re-run of this run (same run number, same tag): replace its zip.
+            gh release upload "$tag" dist/Phosphor-mac.zip -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/Phosphor-mac.zip -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Phosphor $VERSION (Rob's fork)" --notes-file dist/notes.md --latest
+          fi
+          echo "Published $tag: fork builds update to it within the hour."
