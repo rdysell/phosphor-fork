@@ -4,3 +4,4 @@ fork-tools
 fork-updater         # fork only, never upstream: updates come from the fork's own builds; the workflow that makes them
 isf-render-example   # fillinthe/phosphor#1: the isf_render example
 fix-open-comp        # new layers go into the comp you opened; clip grid comp names open a comp
+fix-leftover-cut     # fillinthe/phosphor#3: a loop no longer carries over to the next movie
