@@ -42,7 +42,10 @@ jobs:
     # Nowhere but the fork (if this file ever reached upstream, its job is skipped there), and only `rob`: a manual run
     # on another branch would publish, as the newest build, an app without the fixes.
     if: github.repository == 'rdysell/phosphor-fork' && github.ref == 'refs/heads/rob'
-    runs-on: macos-15
+    # macOS 26's image: its Xcode 26 has the macOS 26 SDK that screen capture needs (screencapturekit → apple-metal's
+    # Swift bridge uses MTLTensor etc.). macos-15 defaults to Xcode 16.4, which fails there (first run, 2026-11-23).
+    # The app still runs on macOS 13 and later (MIN_MACOS, checked by bundle-mac.sh).
+    runs-on: macos-26
     timeout-minutes: 150
     env:
       CARGO_TERM_COLOR: never
@@ -57,7 +60,7 @@ jobs:
           fetch-depth: 0
 
       - name: Rust toolchain
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable && xcodebuild -version
 
       - name: Build tools
         run: brew install nasm ninja pkg-config || true
@@ -66,7 +69,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: vendor/ffmpeg
-          key: mac-arm64-ffmpeg-${{ hashFiles('scripts/build-ffmpeg-mac.sh', 'scripts/min-macos') }}
+          key: mac-arm64-ffmpeg-macos26-${{ hashFiles('scripts/build-ffmpeg-mac.sh', 'scripts/min-macos') }}
 
       - uses: actions/cache@v4
         with:
