@@ -1,0 +1,6 @@
+# Branches on rdysell/phosphor-fork merged into `rob`, in this order, on top of upstream main
+# (scripts/fork/update-fork.sh). One per line; # starts a comment. Drop a branch once upstream has merged it.
+fork-tools
+fork-updater         # fork only, never upstream: updates come from the fork's own builds; the workflow that makes them
+isf-render-example   # fillinthe/phosphor#1: the isf_render example
+fix-open-comp        # new layers go into the comp you opened; clip grid comp names open a comp
