@@ -42,12 +42,15 @@ jobs:
     # Nowhere but the fork (if this file ever reached upstream, its job is skipped there), and only `rob`: a manual run
     # on another branch would publish, as the newest build, an app without the fixes.
     if: github.repository == 'rdysell/phosphor-fork' && github.ref == 'refs/heads/rob'
-    # macOS 26's image: its Xcode 26 has the macOS 26 SDK that screen capture needs (screencapturekit → apple-metal's
-    # Swift bridge uses MTLTensor etc.). macos-15 defaults to Xcode 16.4, which fails there (first run, 2026-11-23).
-    # The app still runs on macOS 13 and later (MIN_MACOS, checked by bundle-mac.sh).
-    runs-on: macos-26
+    # Screen capture needs Xcode 26's macOS 26 SDK (screencapturekit → apple-metal's Swift bridge uses MTLTensor etc.):
+    # macos-15's default Xcode 16.4 fails there (first run, 2026-11-23), so DEVELOPER_DIR picks the image's Xcode 26.
+    # macos-15 rather than macos-26: GitHub's macos-26 Macs were all taken three times in a row the same afternoon
+    # ("not acquired by Runner … after multiple attempts"); macos-15 is the bigger pool. The app still runs on macOS 13
+    # and later (MIN_MACOS, checked by bundle-mac.sh).
+    runs-on: macos-15
     timeout-minutes: 150
     env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       CARGO_TERM_COLOR: never
       # No screen to draw the panels on (bundle-mac.sh's panel check); the launch test below is the smoke test.
       SKIP_PANEL_CHECK: "1"
@@ -77,8 +80,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/bundle
-          key: mac-arm64-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: mac-arm64-cargo-
+          # Per image and Xcode: objects built by another Xcode's Swift aren't reused.
+          key: mac-arm64-xcode26.3-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: mac-arm64-xcode26.3-cargo-
 
       - name: FFmpeg
         run: "[[ -x vendor/ffmpeg/bin/ffmpeg ]] || scripts/build-ffmpeg-mac.sh"
