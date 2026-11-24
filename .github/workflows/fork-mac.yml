@@ -4,13 +4,13 @@
 # downloads. On this branch the updater reads only the fork's releases (crates/phosphor/src/update.rs), so a build of
 # `rob` keeps its fixes when it updates. Fork-only branch `fork-updater`; see FORK.md on the fork's `fork-tools` branch.
 #
-# Signing: ad-hoc by default. The first install by hand is blocked once by macOS (System Settings › Privacy & Security ›
-# Open Anyway); updates the app installs itself aren't. With all five repository secrets below it's signed with a
-# Developer ID certificate and notarized instead (untested until they exist):
+# Signing: every build is signed with Rob's Developer ID and notarized (his choice, 2026-11-23), from these repository
+# secrets. The `secrets` job checks them first, on Linux, and stops the build when one is missing or wrong: a signed
+# install refuses an ad-hoc update (update.rs `same_signer`), and before that check an empty secret quietly gave an
+# unsigned release (v0.5.20-rob.5).
 #   MAC_CERT_P12       base64 of the "Developer ID Application" certificate exported as .p12, with its private key
 #   MAC_CERT_PASSWORD  that .p12's password
 #   NOTARY_APPLE_ID, NOTARY_TEAM_ID, NOTARY_PASSWORD   Apple ID, team ID and an app-specific password, for notarytool
-# Once builds are signed, keep the secrets: a signed install refuses an ad-hoc update (update.rs `same_signer`).
 #
 # Keep this file's name: the build number is its run number, and a renamed workflow counts from 1 again (no update
 # would be offered until upstream's next version).
@@ -38,7 +38,52 @@ defaults:
     shell: bash
 
 jobs:
+  # The signing secrets, checked on Linux before a Mac is asked for (GitHub's Macs can take a while to come free).
+  secrets:
+    if: github.repository == 'rdysell/phosphor-fork' && github.ref == 'refs/heads/rob'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Signing secrets
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          bad=0
+          for n in MAC_CERT_P12 MAC_CERT_PASSWORD NOTARY_APPLE_ID NOTARY_TEAM_ID NOTARY_PASSWORD; do
+            if [[ -n "${!n}" ]]; then echo "$n: set"; else echo "::error::$n is empty or missing (gh secret set $n -R $GITHUB_REPOSITORY)"; bad=1; fi
+          done
+          # The certificate: base64 of a .p12 that opens with MAC_CERT_PASSWORD and holds a Developer ID Application certificate
+          # and its private key. (Older Keychain exports use ciphers OpenSSL 3 only reads with -legacy.)
+          if [[ -n "$MAC_CERT_P12" && -n "$MAC_CERT_PASSWORD" ]]; then
+            p12="$RUNNER_TEMP/check.p12"
+            if ! printf '%s' "$MAC_CERT_P12" | tr -d '\r\n ' | base64 --decode > "$p12" 2>/dev/null || [[ ! -s "$p12" ]]; then
+              echo "::error::MAC_CERT_P12 isn't base64 of a file"; bad=1
+            else
+              echo "MAC_CERT_P12 decodes to $(wc -c < "$p12" | tr -d ' ') bytes"
+              certs="" opened=""
+              for legacy in "" -legacy; do
+                if certs=$(openssl pkcs12 $legacy -in "$p12" -passin env:MAC_CERT_PASSWORD -nokeys 2>/dev/null); then opened=1; break; fi
+              done
+              if [[ -z "$opened" ]]; then
+                echo "::error::MAC_CERT_P12 doesn't open with MAC_CERT_PASSWORD: wrong password, or not a .p12"; bad=1
+              else
+                subjects=$(printf '%s\n' "$certs" | openssl crl2pkcs7 -nocrl -certfile /dev/stdin 2>/dev/null | openssl pkcs7 -print_certs -noout 2>/dev/null | grep '^subject=' || true)
+                echo "${subjects:-(no certificate in it)}"
+                [[ "$subjects" == *"Developer ID Application"* ]] || { echo "::error::MAC_CERT_P12 holds no Developer ID Application certificate"; bad=1; }
+                keys=$(openssl pkcs12 $legacy -in "$p12" -passin env:MAC_CERT_PASSWORD -nocerts -nodes 2>/dev/null | grep -c 'PRIVATE KEY' || true)
+                [[ "$keys" -ge 1 ]] || { echo "::error::MAC_CERT_P12 has no private key: export it from Keychain Access › My Certificates, where the key shows under the certificate"; bad=1; }
+              fi
+            fi
+            rm -f "$p12"
+          fi
+          exit $bad
+
   build:
+    needs: secrets
     # Nowhere but the fork (if this file ever reached upstream, its job is skipped there), and only `rob`: a manual run
     # on another branch would publish, as the newest build, an app without the fixes.
     if: github.repository == 'rdysell/phosphor-fork' && github.ref == 'refs/heads/rob'
