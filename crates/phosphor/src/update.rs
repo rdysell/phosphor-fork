@@ -10,10 +10,16 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui_phosphor::regular as icon;
 
-pub const RELEASES_API: &str = "https://api.github.com/repos/fillinthe/phosphor/releases/latest";
-pub const RELEASES_PAGE: &str = "https://github.com/fillinthe/phosphor/releases";
+// Rob's fork: updates come from rdysell/phosphor-fork's releases, never upstream's (fillinthe/phosphor). Upstream's app
+// would replace this build and drop every fix upstream hasn't merged. The fork's builds are upstream's version plus
+// `-rob.<build>` (FORK_SUFFIX; made by .github/workflows/fork-mac.yml). Fork-only branch `fork-updater`, never for an
+// upstream pull request: see FORK.md on the fork's `fork-tools` branch.
+pub const RELEASES_API: &str = "https://api.github.com/repos/rdysell/phosphor-fork/releases/latest";
+pub const RELEASES_PAGE: &str = "https://github.com/rdysell/phosphor-fork/releases";
 /// Redirects to the newest release's page; no API rate limit (the fallback check reads the tag from where it lands).
-pub const LATEST_PAGE: &str = "https://github.com/fillinthe/phosphor/releases/latest";
+pub const LATEST_PAGE: &str = "https://github.com/rdysell/phosphor-fork/releases/latest";
+/// What a fork build adds to upstream's version: "0.5.19-rob.3" is upstream 0.5.19 with the fixes, build 3.
+const FORK_SUFFIX: &str = "-rob.";
 /// This build's download name (what `scripts/release-github.sh` uploads): Intel Macs have their own build.
 pub const ZIP_NAME: &str = if cfg!(windows) {
     "Phosphor-windows.zip"
@@ -25,14 +31,22 @@ pub const ZIP_NAME: &str = if cfg!(windows) {
 
 /// This build's download of a given version.
 pub fn zip_url(version: &str) -> String {
-    format!("https://github.com/fillinthe/phosphor/releases/download/v{version}/{ZIP_NAME}")
+    format!("https://github.com/rdysell/phosphor-fork/releases/download/v{version}/{ZIP_NAME}")
 }
 
-/// "…/releases/tag/v0.2.42" → "0.2.42".
+/// "…/releases/tag/v0.5.19-rob.3" → "0.5.19-rob.3" (only a fork build's tag).
 fn version_from_url(url: &str) -> Option<String> {
     let tag = url.split("/releases/tag/").nth(1)?.split(['?', '#', '/']).next()?;
     let v = tag.trim_start_matches(['v', 'V']);
-    (!parse_version(v).is_empty()).then(|| v.to_string())
+    fork_build(v).then(|| v.to_string())
+}
+
+/// A version only the fork's build makes ("0.5.19-rob.3"). Anything else on the fork's releases (a zip of upstream's
+/// app uploaded by hand) is never offered: installing it would drop the fixes. (So a PHOSPHOR_UPDATE_URL test server
+/// for the bench's `--quick update` must tag its release `v<version>-rob.<n>` too.)
+fn fork_build(v: &str) -> bool {
+    let (base, build) = parse_version(v);
+    !base.is_empty() && build.is_some()
 }
 const CHECK_EVERY: f64 = 60.0 * 60.0;
 
@@ -115,14 +129,21 @@ impl Updater {
     }
 }
 
-/// "v0.2.1" → [0, 2, 1]
-fn parse_version(v: &str) -> Vec<u32> {
-    v.trim().trim_start_matches(['v', 'V']).split(['.', '-', '+']).map_while(|p| p.parse::<u32>().ok()).collect()
+/// "v0.2.1" → ([0, 2, 1], None); a fork build "0.5.19-rob.3" → ([0, 5, 19], Some(3)).
+fn parse_version(v: &str) -> (Vec<u32>, Option<u32>) {
+    let v = v.trim().trim_start_matches(['v', 'V']);
+    let (base, build) = match v.split_once(FORK_SUFFIX) {
+        Some((base, n)) => (base, n.parse::<u32>().ok()),
+        None => (v, None),
+    };
+    (base.split(['.', '-', '+']).map_while(|p| p.parse::<u32>().ok()).collect(), build)
 }
 
+/// Upstream's version first, then the fork's build number: 0.5.19 < 0.5.19-rob.1 < 0.5.19-rob.2 < 0.5.20 <
+/// 0.5.20-rob.3. A fork build is upstream's release plus the fixes, so it comes after that release and before the next.
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     let (a, b) = (parse_version(candidate), parse_version(current));
-    !a.is_empty() && a > b
+    !a.0.is_empty() && a > b
 }
 
 fn parse_release(text: &str) -> Result<Option<Release>, String> {
@@ -130,6 +151,9 @@ fn parse_release(text: &str) -> Result<Option<Release>, String> {
     let Some(tag) = v.get("tag_name").and_then(|t| t.as_str()) else {
         return Ok(None); // no releases yet
     };
+    if !fork_build(tag) {
+        return Ok(None); // not one of the fork's builds: never offered
+    }
     let zip = v
         .get("assets")
         .and_then(|a| a.as_array())
@@ -346,12 +370,10 @@ fn update_count_body(from: &str, to: &str) -> String {
 
 /// One anonymous request when an update starts downloading (the button or by itself): fire and forget on its own
 /// thread with a short timeout; the update never waits for it or fails because of it.
+/// Fork build: nothing is sent. G Workshop counts updates to upstream's releases, and an update from the fork isn't one.
 #[cfg(not(target_arch = "wasm32"))]
 fn count_update(to: &str) {
-    let body = update_count_body(env!("CARGO_PKG_VERSION"), to);
-    let _ = std::thread::Builder::new().name("phosphor-update-count".into()).spawn(move || {
-        let _ = ureq::post(UPDATE_COUNT_URL).timeout(std::time::Duration::from_secs(5)).set("Content-Type", "application/json").send_string(&body);
-    });
+    let _ = (to, update_count_body, UPDATE_COUNT_URL);
 }
 
 impl Updater {
@@ -788,6 +810,27 @@ mod tests {
         assert!(!is_newer("garbage", "0.1.0"));
     }
 
+    /// Fork builds: upstream's version first, then the build number (numbers, not text: 10 after 9).
+    #[test]
+    fn fork_versions_compare() {
+        assert!(is_newer("v0.5.19-rob.4", "0.5.19-rob.3"));
+        assert!(is_newer("0.5.19-rob.10", "0.5.19-rob.9"));
+        assert!(!is_newer("0.5.19-rob.3", "0.5.19-rob.3"));
+        assert!(!is_newer("0.5.19-rob.3", "0.5.19-rob.4"));
+        // The next upstream version, with the fixes, is newer whatever the build number.
+        assert!(is_newer("0.5.20-rob.5", "0.5.19-rob.9"));
+        assert!(!is_newer("0.5.19-rob.9", "0.5.20-rob.5"));
+        // A fork build comes after the upstream release it's built on, and before the next one.
+        assert!(is_newer("0.5.19-rob.1", "0.5.19"));
+        assert!(!is_newer("0.5.19", "0.5.19-rob.1"));
+        assert!(is_newer("0.5.20", "0.5.19-rob.7"));
+        assert!(!is_newer("0.5.18-rob.7", "0.5.19"));
+        // What this build calls itself when the fork's workflow made it.
+        assert_eq!(parse_version("0.5.19-rob.12"), (vec![0, 5, 19], Some(12)));
+        assert_eq!(parse_version("0.5.19"), (vec![0, 5, 19], None));
+        assert!(fork_build("v0.5.19-rob.1") && !fork_build("0.5.19") && !fork_build("0.5.19-rob.") && !fork_build("-rob.3"));
+    }
+
     #[test]
     fn the_update_count_says_only_the_app_and_versions() {
         let v: serde_json::Value = serde_json::from_str(&update_count_body("0.5.11", "0.5.12")).unwrap();
@@ -830,26 +873,41 @@ mod tests {
 
     #[test]
     fn version_from_the_latest_redirect() {
-        assert_eq!(version_from_url("https://github.com/fillinthe/phosphor/releases/tag/v0.2.42").as_deref(), Some("0.2.42"));
-        assert_eq!(version_from_url("https://github.com/fillinthe/phosphor/releases"), None);
-        assert_eq!(zip_url("0.2.42"), format!("https://github.com/fillinthe/phosphor/releases/download/v0.2.42/{ZIP_NAME}"));
+        assert_eq!(version_from_url("https://github.com/rdysell/phosphor-fork/releases/tag/v0.5.19-rob.3").as_deref(), Some("0.5.19-rob.3"));
+        assert_eq!(version_from_url("https://github.com/rdysell/phosphor-fork/releases"), None);
+        // A tag the fork's build didn't make (upstream's app uploaded by hand) is never offered.
+        assert_eq!(version_from_url("https://github.com/rdysell/phosphor-fork/releases/tag/v0.2.42"), None);
+        assert_eq!(zip_url("0.5.19-rob.3"), format!("https://github.com/rdysell/phosphor-fork/releases/download/v0.5.19-rob.3/{ZIP_NAME}"));
+    }
+
+    /// The updater looks only at the fork, never at upstream's releases.
+    #[test]
+    fn updates_come_from_the_fork() {
+        let zip = zip_url("0.5.19-rob.1");
+        for url in [RELEASES_API, RELEASES_PAGE, LATEST_PAGE, zip.as_str()] {
+            assert!(url.contains("/rdysell/phosphor-fork/"), "{url}");
+            assert!(!url.contains("fillinthe"), "{url}");
+        }
     }
 
     #[test]
     fn release_json() {
         let json = format!(
-            r#"{{"tag_name":"v0.3.0","body":"notes","html_url":"https://x/y","assets":[{{"name":"Phosphor-mac-intel.zip","browser_download_url":"https://x/intel.zip"}},{{"name":"Phosphor-mac.zip","browser_download_url":"https://x/arm.zip"}},{{"name":"Phosphor-windows.zip","browser_download_url":"https://x/win.zip"}}]}}"#
+            r#"{{"tag_name":"v0.3.0-rob.2","body":"notes","html_url":"https://x/y","assets":[{{"name":"Phosphor-mac-intel.zip","browser_download_url":"https://x/intel.zip"}},{{"name":"Phosphor-mac.zip","browser_download_url":"https://x/arm.zip"}},{{"name":"Phosphor-windows.zip","browser_download_url":"https://x/win.zip"}}]}}"#
         );
         let r = parse_release(&json).unwrap().unwrap();
-        assert_eq!(r.version, "0.3.0");
+        assert_eq!(r.version, "0.3.0-rob.2");
         let want = match ZIP_NAME {
             "Phosphor-mac-intel.zip" => "https://x/intel.zip",
             "Phosphor-mac.zip" => "https://x/arm.zip",
             _ => "https://x/win.zip",
         };
         assert_eq!(r.zip.as_deref(), Some(want), "this build's own download");
-        let only_arm = r#"{"tag_name":"v0.3.1","assets":[{"name":"Phosphor-mac.zip","browser_download_url":"https://x/arm.zip"}]}"#;
+        let only_arm = r#"{"tag_name":"v0.3.1-rob.3","assets":[{"name":"Phosphor-mac.zip","browser_download_url":"https://x/arm.zip"}]}"#;
         assert_eq!(parse_release(only_arm).unwrap().unwrap().zip.is_some(), ZIP_NAME == "Phosphor-mac.zip", "never another build's zip");
         assert!(parse_release(r#"{"message":"Not Found"}"#).unwrap().is_none());
+        // A release the fork's build didn't make: as if there were none.
+        let plain = r#"{"tag_name":"v0.3.1","assets":[{"name":"Phosphor-mac.zip","browser_download_url":"https://x/arm.zip"}]}"#;
+        assert!(parse_release(plain).unwrap().is_none());
     }
 }
